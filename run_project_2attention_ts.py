@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from stock_return_project3 import (
+from stock_return_project4 import (
     TrainConfig,
     ExperimentData,
     download_price_history,
@@ -28,6 +28,8 @@ from stock_return_project3 import (
     backtest_long_short,
     summarize_cross_sectional_metrics,
     build_model,
+    DEFAULT_LIQUID_TICKERS,
+    SP500_TICKERS
 )
 
 
@@ -167,8 +169,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon",        type=int,   default=1)
     parser.add_argument("--train-size",     type=float, default=0.7)
     parser.add_argument("--val-size",       type=float, default=0.15)
-    parser.add_argument("--rolling-zscore", action="store_true", default = True)
+    parser.add_argument("--rolling-zscore", action="store_true")
     parser.add_argument("--rolling-window", type=int,   default=60)
+    parser.add_argument(
+        "--universe",
+        choices=["small", "sp500", "auto"],
+        default="small",
+        help="Stock universe to use: 'small' (50), 'sp500' (full list), 'auto' (scrape Wikipedia).",
+    )
     return parser.parse_args()
 
 
@@ -178,6 +186,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    tickers = UNIVERSES[args.universe]
+    print(f"Universe: {args.universe} ({len(tickers) if tickers else 'Wikipedia scrape'})", flush=True)
 
     # ------------------------------------------------------------------ #
     # Per-model train configs                                              #
@@ -226,6 +237,7 @@ def main() -> None:
     # Data                                                                 #
     # ------------------------------------------------------------------ #
     print("Downloading price history...", flush=True)
+
     raw_prices = download_price_history(start=args.start, end=args.end)
 
     print("Preparing experiment data...", flush=True)
