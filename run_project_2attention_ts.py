@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon",        type=int,   default=1)
     parser.add_argument("--train-size",     type=float, default=0.7)
     parser.add_argument("--val-size",       type=float, default=0.15)
-    parser.add_argument("--rolling-zscore", action="store_true")
+    parser.add_argument("--rolling-zscore", action="store_true", default = True)
     parser.add_argument("--rolling-window", type=int,   default=60)
     return parser.parse_args()
 
