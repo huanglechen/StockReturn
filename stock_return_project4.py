@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import OneCycleLR
 
 try:
     import yfinance as yf
@@ -626,6 +627,14 @@ def train_model(
     )
     criterion = nn.MSELoss()
     history = {"train_loss": [], "val_loss": []}
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=config.learning_rate,
+        steps_per_epoch=len(train_loader),
+        epochs=config.max_epochs,
+    ) if isinstance(model, TransformerRegressor) else None
+    
     best_state = copy.deepcopy(model.state_dict())
     best_val_loss = math.inf
     patience_left = config.patience
@@ -654,6 +663,10 @@ def train_model(
         )
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        
+        if scheduler is not None:
+            scheduler.step()
+            
         epoch_seconds = time.perf_counter() - epoch_start
 
         if config.verbose:
