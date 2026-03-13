@@ -294,7 +294,7 @@ def main() -> None:
         hidden_dim=64,
         num_layers=2,
         dropout=0.15,
-        learning_rate=1e-4,   # slightly higher than before — concatenation helps gradient flow
+        learning_rate=5e-4,   # slightly higher than before — concatenation helps gradient flow
         weight_decay=1e-5,
         max_epochs=25,
         patience=6,
@@ -305,7 +305,7 @@ def main() -> None:
         hidden_dim=64,
         num_layers=2,
         dropout=0.15,
-        learning_rate=1e-4,
+        learning_rate=5e-4,
         weight_decay=1e-5,
         max_epochs=25,
         patience=6,
