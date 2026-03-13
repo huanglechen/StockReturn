@@ -28,6 +28,7 @@ from stock_return_project4 import (
     summarize_cross_sectional_metrics,
     build_model,
     DEFAULT_LIQUID_TICKERS,
+    NASDAQ100_TICKERS,
     SP500_TICKERS,
 )
 
@@ -37,6 +38,7 @@ from stock_return_project4 import (
 
 UNIVERSES = {
     "small": DEFAULT_LIQUID_TICKERS,   # 50 stocks — fast, good for testing
+    "nasdaq100": NASDAQ100_TICKERS,    # current Nasdaq-100 constituents
     "sp500": SP500_TICKERS,            # full S&P 500 list from project file
     "auto":  None,                     # None = scrape Wikipedia at runtime
 }
@@ -169,9 +171,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--universe",
-        choices=["small", "sp500", "auto"],
+        choices=["small", "nasdaq100", "sp500", "auto"],
         default="small",
-        help="Stock universe: 'small' (50 stocks), 'sp500' (full list), 'auto' (scrape Wikipedia).",
+        help="Stock universe: 'small' (50 stocks), 'nasdaq100', 'sp500' (full list), 'auto' (scrape Wikipedia).",
     )
     return parser.parse_args()
 

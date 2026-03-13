@@ -2,6 +2,7 @@
 Run cross-sectional stock return prediction experiments.
 
 Models:
+  - RNN   : vanilla recurrent baseline, no attention
   - LSTM  : with temporal attention (single-head or multi-head, toggled by --attn-heads)
   - GRU   : with temporal attention (single-head or multi-head, toggled by --attn-heads)
   - TRANSFORMER : original, no attention module
@@ -24,6 +25,7 @@ Example runs:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -43,6 +45,7 @@ from stock_return_project4 import (
     summarize_cross_sectional_metrics,
     build_model,
     DEFAULT_LIQUID_TICKERS,
+    NASDAQ100_TICKERS,
     SP500_TICKERS,
 )
 
@@ -52,6 +55,7 @@ from stock_return_project4 import (
 
 UNIVERSES = {
     "small": DEFAULT_LIQUID_TICKERS,
+    "nasdaq100": NASDAQ100_TICKERS,
     "sp500": SP500_TICKERS,
     "auto":  None,
 }
@@ -302,7 +306,7 @@ def run_experiment(
 
     val_ic  = compute_daily_ic(val_predictions)
     test_ic = compute_daily_ic(test_predictions)
-    _, portfolio_summary = backtest_long_short(test_predictions)
+    portfolio_curve, portfolio_summary = backtest_long_short(test_predictions)
     val_diagnostics = summarize_prediction_diagnostics(val_predictions)
     test_diagnostics = summarize_prediction_diagnostics(test_predictions)
 
@@ -332,6 +336,7 @@ def run_experiment(
         "test_ic":           test_ic,
         "val_summary":       summarize_cross_sectional_metrics(val_ic),
         "test_summary":      summarize_cross_sectional_metrics(test_ic),
+        "portfolio_curve":   portfolio_curve,
         "portfolio_summary": portfolio_summary,
         "val_diagnostics":   val_diagnostics,
         "test_diagnostics":  test_diagnostics,
@@ -362,9 +367,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--universe",
-        choices=["small", "sp500", "auto"],
+        choices=["small", "nasdaq100", "sp500", "auto"],
         default="small",
-        help="Stock universe: 'small' (50), 'sp500' (full list), 'auto' (Wikipedia).",
+        help="Stock universe: 'small' (50), 'nasdaq100' (Nasdaq-100), 'sp500' (full list), 'auto' (Wikipedia).",
     )
     parser.add_argument(
         "--attn-heads",
@@ -381,6 +386,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-buffer-days", type=int, default=5)
     parser.add_argument("--end-buffer-days", type=int, default=5)
     parser.add_argument(
+        "--output-dir",
+        default="results",
+        help="Directory to save the final summary csv.",
+    )
+    parser.add_argument(
         "--target-cs-zscore",
         action="store_true",
         help="Train on per-date cross-sectionally standardized targets while keeping raw returns for evaluation/backtests.",
@@ -388,7 +398,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def select_train_configs(profile: str, device: str) -> tuple[TrainConfig, TrainConfig, TrainConfig]:
+def select_train_configs(profile: str, device: str) -> tuple[TrainConfig, TrainConfig, TrainConfig, TrainConfig]:
     if profile == "sp500_stable":
         return (
             TrainConfig(
@@ -397,6 +407,19 @@ def select_train_configs(profile: str, device: str) -> tuple[TrainConfig, TrainC
                 num_layers=2,
                 dropout=0.05,
                 learning_rate=3e-4,
+                weight_decay=1e-5,
+                max_epochs=20,
+                patience=8,
+                grad_clip=1.0,
+                device=device,
+                log_interval=400,
+            ),
+            TrainConfig(
+                batch_size=256,
+                hidden_dim=96,
+                num_layers=2,
+                dropout=0.05,
+                learning_rate=5e-4,
                 weight_decay=1e-5,
                 max_epochs=20,
                 patience=8,
@@ -439,7 +462,19 @@ def select_train_configs(profile: str, device: str) -> tuple[TrainConfig, TrainC
             hidden_dim=64,
             num_layers=2,
             dropout=0.15,
-            learning_rate=1e-4,
+            learning_rate=3e-4,
+            weight_decay=1e-5,
+            max_epochs=25,
+            patience=6,
+            grad_clip=1.0,
+            device=device,
+        ),
+        TrainConfig(
+            batch_size=128,
+            hidden_dim=64,
+            num_layers=2,
+            dropout=0.15,
+            learning_rate=5e-4,
             weight_decay=1e-5,
             max_epochs=25,
             patience=6,
@@ -487,7 +522,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     tickers = UNIVERSES[args.universe]
     n_label = len(tickers) if tickers is not None else "Wikipedia scrape"
-    config_lstm, config_gru, config_transformer = select_train_configs(args.profile, device)
+    config_rnn, config_lstm, config_gru, config_transformer = select_train_configs(args.profile, device)
     print(f"Universe  : {args.universe} ({n_label} tickers)", flush=True)
     print(f"Profile   : {args.profile}", flush=True)
     print(f"Attn heads: {args.attn_heads} ({'multi-head' if args.attn_heads > 1 else 'single-head'})", flush=True)
@@ -544,6 +579,13 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Build models                                                         #
     # ------------------------------------------------------------------ #
+    model_rnn = build_model(
+        model_name="RNN",
+        input_dim=input_dim,
+        hidden_dim=config_rnn.hidden_dim,
+        num_layers=config_rnn.num_layers,
+        dropout=config_rnn.dropout,
+    )
     model_lstm = AttentionSequenceRegressor(
         input_dim=input_dim,
         hidden_dim=config_lstm.hidden_dim,
@@ -573,6 +615,7 @@ def main() -> None:
     # Train                                                                #
     # ------------------------------------------------------------------ #
     results = {}
+    results["RNN"]         = run_experiment(model_rnn,         "RNN",         experiment_data, config_rnn)
     results["LSTM"]        = run_experiment(model_lstm,        "LSTM",        experiment_data, config_lstm)
     results["GRU"]         = run_experiment(model_gru,         "GRU",         experiment_data, config_gru)
     results["TRANSFORMER"] = run_experiment(model_transformer, "TRANSFORMER", experiment_data, config_transformer)
@@ -595,8 +638,14 @@ def main() -> None:
     )
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 160)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target_tag = "targetz" if args.target_cs_zscore else "raw"
+    summary_path = output_dir / f"mhattn_{args.universe}_{args.profile}_{target_tag}_attn{args.attn_heads}.summary.csv"
+    summary.to_csv(summary_path, index=False)
     print("\n=== FINAL RESULTS ===")
     print(summary.to_string(index=False))
+    print(f"\nSaved summary to {summary_path}", flush=True)
 
 
 if __name__ == "__main__":
