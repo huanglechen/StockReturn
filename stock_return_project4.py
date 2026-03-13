@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +109,7 @@ class ExperimentData:
     datasets: dict[str, "PanelSequenceDataset"]
     feature_columns: list[str]
     target_column: str
+    evaluation_target_column: str | None = None
 
 
 @dataclass
@@ -123,6 +125,9 @@ class TrainConfig:
     patience: int = 5
     grad_clip: float | None = 1.0
     device: str | None = None
+    num_workers: int | None = None
+    pin_memory: bool | None = None
+    persistent_workers: bool | None = None
     verbose: bool = True
     log_interval: int = 200
 
@@ -347,6 +352,23 @@ def cross_sectional_standardize(
     return standardized
 
 
+def cross_sectional_standardize_target(
+    frame: pd.DataFrame,
+    target_col: str,
+    date_col: str = "Date",
+    eps: float = 1e-8,
+    suffix: str = "_cs_zscore",
+) -> tuple[pd.DataFrame, str]:
+    standardized = frame.copy()
+    output_col = f"{target_col}{suffix}"
+    grouped = standardized.groupby(date_col)[target_col]
+    means = grouped.transform("mean")
+    stds = grouped.transform("std")
+    safe_stds = stds.mask(stds.abs() <= eps, 1.0).fillna(1.0)
+    standardized[output_col] = (standardized[target_col] - means) / safe_stds
+    return standardized, output_col
+
+
 def rolling_standardize(
     frame: pd.DataFrame,
     feature_cols: list[str],
@@ -432,6 +454,21 @@ def build_panel_tensors(
     return X, y, dates, tickers
 
 
+def build_target_tensor(
+    frame: pd.DataFrame,
+    target_col: str,
+    dates: np.ndarray,
+    tickers: np.ndarray,
+    date_col: str = "Date",
+    stock_col: str = "Ticker",
+) -> np.ndarray:
+    target_panel = (
+        frame.pivot(index=date_col, columns=stock_col, values=target_col)
+        .reindex(index=pd.to_datetime(dates), columns=tickers)
+    )
+    return target_panel.to_numpy(dtype=np.float32)
+
+
 class PanelSequenceDataset(Dataset):
     def __init__(
         self,
@@ -440,12 +477,14 @@ class PanelSequenceDataset(Dataset):
         lookback: int = 60,
         dates: np.ndarray | None = None,
         tickers: np.ndarray | None = None,
+        y_eval: np.ndarray | None = None,
     ) -> None:
         if lookback < 1:
             raise ValueError("lookback must be positive.")
 
         self.X = X
         self.y = y
+        self.y_eval = y if y_eval is None else y_eval
         self.lookback = lookback
         self.dates = np.arange(len(X)) if dates is None else dates
         self.tickers = np.arange(X.shape[1]) if tickers is None else tickers
@@ -470,6 +509,7 @@ class PanelSequenceDataset(Dataset):
         return {
             "x": torch.from_numpy(self.X[time_idx - self.lookback : time_idx, stock_idx]).float(),
             "y": torch.tensor(self.y[time_idx, stock_idx]).float(),
+            "y_eval": torch.tensor(self.y_eval[time_idx, stock_idx]).float(),
             "time_idx": torch.tensor(time_idx, dtype=torch.long),
             "stock_idx": torch.tensor(stock_idx, dtype=torch.long),
         }
@@ -610,11 +650,32 @@ def build_model(
 def make_data_loaders(
     datasets: dict[str, PanelSequenceDataset],
     batch_size: int = 256,
+    device: str | None = None,
+    num_workers: int | None = None,
+    pin_memory: bool | None = None,
+    persistent_workers: bool | None = None,
 ) -> dict[str, DataLoader]:
+    use_cuda = (device or "").startswith("cuda")
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        num_workers = min(2, max(0, cpu_count - 1)) if use_cuda else 0
+    if pin_memory is None:
+        pin_memory = use_cuda
+    if persistent_workers is None:
+        persistent_workers = num_workers > 0
+
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+
     return {
-        "train": DataLoader(datasets["train"], batch_size=batch_size, shuffle=True),
-        "val": DataLoader(datasets["val"], batch_size=batch_size, shuffle=False),
-        "test": DataLoader(datasets["test"], batch_size=batch_size, shuffle=False),
+        "train": DataLoader(datasets["train"], shuffle=True, **loader_kwargs),
+        "val": DataLoader(datasets["val"], shuffle=False, **loader_kwargs),
+        "test": DataLoader(datasets["test"], shuffle=False, **loader_kwargs),
     }
 
 
@@ -764,7 +825,7 @@ def predict_dataset(
         for batch in loader:
             x = batch["x"].to(device)
             predictions = model(x).cpu().numpy()
-            targets = batch["y"].cpu().numpy()
+            targets = batch["y_eval"].cpu().numpy() if "y_eval" in batch else batch["y"].cpu().numpy()
             time_idx = batch["time_idx"].cpu().numpy()
             stock_idx = batch["stock_idx"].cpu().numpy()
 
@@ -908,6 +969,7 @@ def prepare_experiment_data(
     winsorize: bool = True,
     apply_rolling_zscore: bool = False,
     rolling_window: int = 60,
+    target_cross_sectional_zscore: bool = False,
 ) -> ExperimentData:
     feature_cols = list(feature_cols or DEFAULT_FEATURE_COLUMNS)
     cleaned = trim_and_fill_history(flatten_price_frame(raw_prices))
@@ -919,8 +981,12 @@ def prepare_experiment_data(
     if apply_rolling_zscore:
         featured = rolling_standardize(featured, feature_cols, window=rolling_window)
 
-    target_col = f"target_return_{horizon}d"
-    featured = featured.dropna(subset=feature_cols + [target_col]).reset_index(drop=True)
+    evaluation_target_col = f"target_return_{horizon}d"
+    target_col = evaluation_target_col
+    if target_cross_sectional_zscore:
+        featured, target_col = cross_sectional_standardize_target(featured, evaluation_target_col)
+
+    featured = featured.dropna(subset=feature_cols + [target_col, evaluation_target_col]).reset_index(drop=True)
     splits = split_by_time(featured, train_size=train_size, val_size=val_size)
     panels: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     datasets: dict[str, PanelSequenceDataset] = {}
@@ -928,12 +994,14 @@ def prepare_experiment_data(
     for split_name, split_frame in splits.items():
         panels[split_name] = build_panel_tensors(split_frame, feature_cols, target_col)
         X, y, dates, tickers = panels[split_name]
+        y_eval = build_target_tensor(split_frame, evaluation_target_col, dates, tickers)
         datasets[split_name] = PanelSequenceDataset(
             X,
             y,
             lookback=lookback,
             dates=dates,
             tickers=tickers,
+            y_eval=y_eval,
         )
 
     return ExperimentData(
@@ -944,6 +1012,7 @@ def prepare_experiment_data(
         datasets=datasets,
         feature_columns=feature_cols,
         target_column=target_col,
+        evaluation_target_column=evaluation_target_col,
     )
 
 
@@ -955,7 +1024,14 @@ def run_single_experiment(
     train_config = train_config or TrainConfig()
     if train_config.verbose:
         print(f"=== Running model: {model_name.upper()} ===", flush=True)
-    loaders = make_data_loaders(experiment_data.datasets, batch_size=train_config.batch_size)
+    loaders = make_data_loaders(
+        experiment_data.datasets,
+        batch_size=train_config.batch_size,
+        device=train_config.device,
+        num_workers=train_config.num_workers,
+        pin_memory=train_config.pin_memory,
+        persistent_workers=train_config.persistent_workers,
+    )
     model = build_model(
         model_name=model_name,
         input_dim=len(experiment_data.feature_columns),

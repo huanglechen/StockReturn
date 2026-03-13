@@ -111,7 +111,14 @@ def run_experiment(
 ) -> dict:
     print(f"\n=== Training {model_name} ===", flush=True)
 
-    loaders = make_data_loaders(experiment_data.datasets, batch_size=train_config.batch_size)
+    loaders = make_data_loaders(
+        experiment_data.datasets,
+        batch_size=train_config.batch_size,
+        device=train_config.device,
+        num_workers=train_config.num_workers,
+        pin_memory=train_config.pin_memory,
+        persistent_workers=train_config.persistent_workers,
+    )
     model, history = train_model(model, loaders["train"], loaders["val"], train_config)
 
     device = train_config.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -155,12 +162,105 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rolling-zscore", action="store_true")
     parser.add_argument("--rolling-window", type=int,   default=60)
     parser.add_argument(
+        "--profile",
+        choices=["default", "sp500_fast"],
+        default="default",
+        help="Training hyperparameter profile. 'sp500_fast' is tuned for broad-universe GPU runs.",
+    )
+    parser.add_argument(
         "--universe",
         choices=["small", "sp500", "auto"],
         default="small",
         help="Stock universe: 'small' (50 stocks), 'sp500' (full list), 'auto' (scrape Wikipedia).",
     )
     return parser.parse_args()
+
+
+def select_train_configs(profile: str, universe: str) -> tuple[TrainConfig, TrainConfig, TrainConfig]:
+    _ = universe
+    if profile == "sp500_fast":
+        return (
+            TrainConfig(
+                batch_size=256,
+                hidden_dim=64,
+                num_layers=2,
+                dropout=0.1,
+                learning_rate=2e-4,
+                weight_decay=1e-5,
+                max_epochs=12,
+                patience=4,
+                log_interval=400,
+            ),
+            TrainConfig(
+                batch_size=512,
+                hidden_dim=96,
+                num_layers=2,
+                dropout=0.1,
+                learning_rate=6e-4,
+                weight_decay=1e-5,
+                max_epochs=12,
+                patience=4,
+                log_interval=400,
+            ),
+            TrainConfig(
+                batch_size=512,
+                hidden_dim=96,
+                num_layers=2,
+                dropout=0.15,
+                num_heads=4,
+                learning_rate=2e-4,
+                weight_decay=5e-5,
+                max_epochs=18,
+                patience=5,
+                log_interval=400,
+            ),
+        )
+
+    return (
+        TrainConfig(
+            batch_size=128,
+            hidden_dim=64,
+            num_layers=2,
+            dropout=0.1,
+            learning_rate=1e-4,
+            weight_decay=1e-5,
+            max_epochs=20,
+            patience=5,
+        ),
+        TrainConfig(
+            batch_size=128,
+            hidden_dim=64,
+            num_layers=2,
+            dropout=0.1,
+            learning_rate=5e-4,
+            weight_decay=1e-5,
+            max_epochs=20,
+            patience=5,
+        ),
+        TrainConfig(
+            batch_size=256,
+            hidden_dim=128,
+            num_layers=3,
+            dropout=0.2,
+            num_heads=8,
+            learning_rate=3e-4,
+            weight_decay=1e-4,
+            max_epochs=30,
+            patience=8,
+        ),
+    )
+
+
+def print_data_summary(experiment_data: ExperimentData) -> None:
+    print("Data summary:", flush=True)
+    for split_name in ("train", "val", "test"):
+        X, y, dates, tickers = experiment_data.panels[split_name]
+        dataset = experiment_data.datasets[split_name]
+        print(
+            f"  {split_name}: panel={X.shape}, target={y.shape}, "
+            f"dates={len(dates)}, tickers={len(tickers)}, samples={len(dataset)}",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -181,18 +281,11 @@ def main() -> None:
     # Per-model train configs                                              #
     # ------------------------------------------------------------------ #
 
-    config_lstm = TrainConfig(
-        batch_size=128, hidden_dim=64, num_layers=2, dropout=0.1,
-        learning_rate=1e-4, weight_decay=1e-5, max_epochs=20, patience=5,
+    config_lstm, config_gru, config_transformer = select_train_configs(
+        profile=args.profile,
+        universe=args.universe,
     )
-    config_gru = TrainConfig(
-        batch_size=128, hidden_dim=64, num_layers=2, dropout=0.1,
-        learning_rate=5e-4, weight_decay=1e-5, max_epochs=20, patience=5,
-    )
-    config_transformer = TrainConfig(
-        batch_size=256, hidden_dim=128, num_layers=3, dropout=0.2, num_heads=8,
-        learning_rate=3e-4, weight_decay=1e-4, max_epochs=30, patience=8,
-    )
+    print(f"Profile: {args.profile}", flush=True)
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
@@ -216,6 +309,7 @@ def main() -> None:
         apply_rolling_zscore=args.rolling_zscore,
         rolling_window=args.rolling_window,
     )
+    print_data_summary(experiment_data)
 
     input_dim = len(experiment_data.feature_columns)
 
