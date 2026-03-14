@@ -2,7 +2,7 @@ import argparse
 
 import pandas as pd
 
-from stock_return_project import (
+from stock_return_core import (
     TrainConfig,
     download_price_history,
     prepare_experiment_data,

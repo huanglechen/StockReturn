@@ -22,7 +22,7 @@ The repository evolved from an initial single-notebook prototype into a reusable
 - Evaluation focus: `mean_ic`, `mean_rank_ic`, `mean_return`, `sharpe_ratio`
 - Main experiment notebook: `C147A_project_average.ipynb`
 - Main training script: `run_project_mhattn.py`
-- Core library: `stock_return_project4.py`
+- Core library: `stock_return_core.py`
 
 ## Models
 
@@ -98,7 +98,8 @@ After averaging, the more defensible conclusion is:
 - `C147A_project.ipynb`: single-run notebook variant
 - `run_project_mhattn.py`: script entry point for attention experiments
 - `run_project_attention_ts.py`: related experiment script
-- `stock_return_project4.py`: shared project library
+- `stock_return_core.py`: shared project library
+- `C147_proposal.pdf`: original project proposal
 
-Legacy files such as `stock_return_project.py` and `stock_return_project3.py` are older versions
-and are no longer the primary entry points.
+Legacy files and earlier experiments are stored under `archive/` and are no longer the primary
+entry points.

@@ -1,10 +1,24 @@
 """
 Run cross-sectional stock return prediction experiments.
 
-Models trained in one call:
-  - TRANSFORMER  : improved hyperparameters, no attention module
-  - LSTM         : with temporal attention (train_config1)
-  - GRU          : with temporal attention (train_config2)
+Models:
+  - LSTM  : with temporal attention (single-head or multi-head, toggled by --attn-heads)
+  - GRU   : with temporal attention (single-head or multi-head, toggled by --attn-heads)
+  - TRANSFORMER : original, no attention module
+
+Attention modes:
+  --attn-heads 1   →  simple additive attention (original single linear layer)
+  --attn-heads 4   →  multi-head attention (recommended)
+
+Example runs:
+  # Single-head attention (baseline)
+  python run_project_mhattn.py --attn-heads 1
+
+  # Multi-head attention (new)
+  python run_project_mhattn.py --attn-heads 4
+
+  # Multi-head + full S&P 500
+  python run_project_mhattn.py --attn-heads 4 --universe sp500
 """
 
 from __future__ import annotations
@@ -15,7 +29,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from stock_return_project4 import (
+from stock_return_core import (
     TrainConfig,
     ExperimentData,
     download_price_history,
@@ -36,33 +50,101 @@ from stock_return_project4 import (
 # ---------------------------------------------------------------------------
 
 UNIVERSES = {
-    "small": DEFAULT_LIQUID_TICKERS,   # 50 stocks — fast, good for testing
-    "sp500": SP500_TICKERS,            # full S&P 500 list from project file
-    "auto":  None,                     # None = scrape Wikipedia at runtime
+    "small": DEFAULT_LIQUID_TICKERS,
+    "sp500": SP500_TICKERS,
+    "auto":  None,
 }
 
 
 # ---------------------------------------------------------------------------
-# Temporal attention module
+# Attention modules
 # ---------------------------------------------------------------------------
 
-class TemporalAttention(nn.Module):
+class SingleHeadAttention(nn.Module):
+    """
+    Simple additive attention — scores each timestep independently.
+    No query vector; one global importance weight per timestep.
+    """
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.attn = nn.Linear(hidden_dim, 1, bias=False)
 
-    def forward(self, encoder_outputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores  = self.attn(encoder_outputs).squeeze(-1)
-        weights = torch.softmax(scores, dim=-1)
-        context = (weights.unsqueeze(-1) * encoder_outputs).sum(dim=1)
+    def forward(self, enc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # enc: (B, T, D)
+        weights = torch.softmax(self.attn(enc).squeeze(-1), dim=-1)   # (B, T)
+        context = (weights.unsqueeze(-1) * enc).sum(dim=1)            # (B, D)
         return context, weights
 
 
+class MultiHeadTemporalAttention(nn.Module):
+    """
+    Multi-head attention where the LAST hidden state acts as the query
+    and attends over all timesteps as keys/values.
+
+    - Multiple heads let the model focus on different temporal patterns
+      simultaneously (e.g. short-term momentum vs longer-term trend).
+    - Using the last hidden state as query gives the attention a
+      meaningful signal to look for, unlike the single-head version
+      which scores timesteps blindly.
+    - Context is concatenated with the last hidden state so no
+      information is lost compared to the vanilla RNN.
+    """
+    def __init__(self, hidden_dim: int, num_heads: int = 4) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_heads = num_heads
+        self.head_dim  = hidden_dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        self.W_q  = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_k  = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_v  = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+    def forward(self, enc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T, D = enc.shape
+        H, HD   = self.num_heads, self.head_dim
+
+        # Last hidden state as query, all timesteps as keys and values
+        query = self.W_q(enc[:, -1:, :])                  # (B, 1, D)
+        keys  = self.W_k(enc)                              # (B, T, D)
+        vals  = self.W_v(enc)                              # (B, T, D)
+
+        # Reshape to multi-head form
+        query = query.view(B, 1, H, HD).transpose(1, 2)   # (B, H, 1, HD)
+        keys  = keys.view(B, T, H, HD).transpose(1, 2)    # (B, H, T, HD)
+        vals  = vals.view(B, T, H, HD).transpose(1, 2)    # (B, H, T, HD)
+
+        # Scaled dot-product attention from query to all keys
+        scores  = (query @ keys.transpose(-2, -1)) * self.scale  # (B, H, 1, T)
+        weights = torch.softmax(scores.squeeze(2), dim=-1)        # (B, H, T)
+
+        # Weighted sum of values
+        context = (weights.unsqueeze(-1) * vals).sum(dim=2)       # (B, H, HD)
+        context = self.W_out(context.view(B, D))                  # (B, D)
+
+        # Average weights across heads for inspection
+        return context, weights.mean(dim=1)                       # (B, T)
+
+
 # ---------------------------------------------------------------------------
-# Attention-augmented LSTM / GRU regressor
+# Attention-augmented LSTM / GRU
 # ---------------------------------------------------------------------------
 
 class AttentionSequenceRegressor(nn.Module):
+    """
+    LSTM or GRU with temporal attention.
+
+    When num_attn_heads == 1: uses SingleHeadAttention.
+    When num_attn_heads  > 1: uses MultiHeadTemporalAttention.
+
+    In both cases the attention context is CONCATENATED with the last
+    hidden state before the prediction head, so no RNN information is lost.
+    """
+
     def __init__(
         self,
         input_dim: int,
@@ -70,6 +152,7 @@ class AttentionSequenceRegressor(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         cell_type: str = "LSTM",
+        num_attn_heads: int = 4,
     ) -> None:
         super().__init__()
         if cell_type not in {"LSTM", "GRU"}:
@@ -82,10 +165,16 @@ class AttentionSequenceRegressor(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.attention = TemporalAttention(hidden_dim)
+
+        if num_attn_heads == 1:
+            self.attention = SingleHeadAttention(hidden_dim)
+        else:
+            self.attention = MultiHeadTemporalAttention(hidden_dim, num_heads=num_attn_heads)
+
+        # Input is context (D) + last hidden state (D) = 2D
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -93,10 +182,20 @@ class AttentionSequenceRegressor(nn.Module):
         self.last_attn_weights: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        encoder_outputs, _ = self.encoder(x)
-        context, weights   = self.attention(encoder_outputs)
+        enc_out, hidden = self.encoder(x)            # enc_out: (B, T, D)
+
+        # Extract last hidden state
+        if isinstance(hidden, tuple):                # LSTM returns (h, c)
+            hidden = hidden[0]
+        last_hidden = hidden[-1]                     # (B, D)
+
+        # Attention context
+        context, weights = self.attention(enc_out)   # (B, D), (B, T)
         self.last_attn_weights = weights.detach()
-        return self.head(context).squeeze(-1)
+
+        # Concatenate and predict
+        combined = torch.cat([last_hidden, context], dim=-1)  # (B, 2D)
+        return self.head(combined).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +243,7 @@ def run_experiment(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train LSTM (attention), GRU (attention), and Transformer."
+        description="Train LSTM/GRU with attention and Transformer."
     )
     parser.add_argument("--start",          default="2015-01-01")
     parser.add_argument("--end",            default="2024-01-01")
@@ -158,7 +257,13 @@ def parse_args() -> argparse.Namespace:
         "--universe",
         choices=["small", "sp500", "auto"],
         default="small",
-        help="Stock universe: 'small' (50 stocks), 'sp500' (full list), 'auto' (scrape Wikipedia).",
+        help="Stock universe: 'small' (50), 'sp500' (full list), 'auto' (Wikipedia).",
+    )
+    parser.add_argument(
+        "--attn-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads for LSTM/GRU. 1 = simple additive, 4+ = multi-head (recommended).",
     )
     return parser.parse_args()
 
@@ -175,34 +280,55 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     tickers = UNIVERSES[args.universe]
     n_label = len(tickers) if tickers is not None else "Wikipedia scrape"
-    print(f"Universe: {args.universe} ({n_label})", flush=True)
+    print(f"Universe  : {args.universe} ({n_label} tickers)", flush=True)
+    print(f"Attn heads: {args.attn_heads} ({'multi-head' if args.attn_heads > 1 else 'single-head'})", flush=True)
 
     # ------------------------------------------------------------------ #
-    # Per-model train configs                                              #
+    # Per-model configs                                                    #
+    # With the new 2D concatenated input to the head, hidden_dim=64 is    #
+    # still fine — the head now sees 128-dim input automatically.         #
     # ------------------------------------------------------------------ #
 
     config_lstm = TrainConfig(
-        batch_size=128, hidden_dim=64, num_layers=2, dropout=0.1,
-        learning_rate=1e-4, weight_decay=1e-5, max_epochs=20, patience=5,
+        batch_size=128,
+        hidden_dim=64,
+        num_layers=2,
+        dropout=0.15,
+        learning_rate=3e-4,   # slightly higher than before — concatenation helps gradient flow
+        weight_decay=1e-5,
+        max_epochs=25,
+        patience=6,
+        grad_clip=1.0,
     )
     config_gru = TrainConfig(
-        batch_size=128, hidden_dim=64, num_layers=2, dropout=0.1,
-        learning_rate=5e-4, weight_decay=1e-5, max_epochs=20, patience=5,
+        batch_size=128,
+        hidden_dim=64,
+        num_layers=2,
+        dropout=0.15,
+        learning_rate=3e-4,
+        weight_decay=1e-5,
+        max_epochs=25,
+        patience=6,
+        grad_clip=1.0,
     )
     config_transformer = TrainConfig(
-        batch_size=256, hidden_dim=128, num_layers=3, dropout=0.2, num_heads=8,
-        learning_rate=3e-4, weight_decay=1e-4, max_epochs=30, patience=8,
+        batch_size=256,
+        hidden_dim=128,
+        num_layers=3,
+        dropout=0.2,
+        num_heads=8,
+        learning_rate=3e-4,
+        weight_decay=1e-4,
+        max_epochs=30,
+        patience=8,
+        grad_clip=1.0,
     )
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
     # ------------------------------------------------------------------ #
-    print("Downloading price history...", flush=True)
-    raw_prices = download_price_history(
-        start=args.start,
-        end=args.end,
-        tickers=tickers,        # ← passes the selected universe
-    )
+    print("\nDownloading price history...", flush=True)
+    raw_prices = download_price_history(start=args.start, end=args.end, tickers=tickers)
     n_stocks = raw_prices.columns.get_level_values(0).nunique()
     print(f"Stocks downloaded: {n_stocks}", flush=True)
 
@@ -216,25 +342,30 @@ def main() -> None:
         apply_rolling_zscore=args.rolling_zscore,
         rolling_window=args.rolling_window,
     )
-
     input_dim = len(experiment_data.feature_columns)
 
     # ------------------------------------------------------------------ #
     # Build models                                                         #
     # ------------------------------------------------------------------ #
-
     model_lstm = AttentionSequenceRegressor(
-        input_dim=input_dim, hidden_dim=config_lstm.hidden_dim,
-        num_layers=config_lstm.num_layers, dropout=config_lstm.dropout,
+        input_dim=input_dim,
+        hidden_dim=config_lstm.hidden_dim,
+        num_layers=config_lstm.num_layers,
+        dropout=config_lstm.dropout,
         cell_type="LSTM",
+        num_attn_heads=args.attn_heads,
     )
     model_gru = AttentionSequenceRegressor(
-        input_dim=input_dim, hidden_dim=config_gru.hidden_dim,
-        num_layers=config_gru.num_layers, dropout=config_gru.dropout,
+        input_dim=input_dim,
+        hidden_dim=config_gru.hidden_dim,
+        num_layers=config_gru.num_layers,
+        dropout=config_gru.dropout,
         cell_type="GRU",
+        num_attn_heads=args.attn_heads,
     )
     model_transformer = build_model(
-        model_name="TRANSFORMER", input_dim=input_dim,
+        model_name="TRANSFORMER",
+        input_dim=input_dim,
         hidden_dim=config_transformer.hidden_dim,
         num_layers=config_transformer.num_layers,
         dropout=config_transformer.dropout,
@@ -244,7 +375,6 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Train                                                                #
     # ------------------------------------------------------------------ #
-
     results = {}
     results["LSTM"]        = run_experiment(model_lstm,        "LSTM",        experiment_data, config_lstm)
     results["GRU"]         = run_experiment(model_gru,         "GRU",         experiment_data, config_gru)
@@ -253,7 +383,6 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Summary                                                              #
     # ------------------------------------------------------------------ #
-
     summary_rows = []
     for model_name, result in results.items():
         summary_rows.append({

@@ -3,6 +3,11 @@
 __pycache__/
 .ipynb_checkpoints/
 data_cache/
+results/
+*.log
+C147A_project.executed.v2.ipynb
+C147A_project_seeded.ipynb
+C147A_project_seeded.executed.ipynb
 *.pyc
 *.pyo
 *.zip

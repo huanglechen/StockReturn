@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from stock_return_project4 import (
+from stock_return_core import (
     TrainConfig,
     ExperimentData,
     download_price_history,
