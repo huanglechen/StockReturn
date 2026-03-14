@@ -21,6 +21,8 @@ The repository evolved from an initial single-notebook prototype into a reusable
 - Lookback window: 60 trading days
 - Evaluation focus: `mean_ic`, `mean_rank_ic`, `mean_return`, `sharpe_ratio`
 - Main experiment notebook: `C147A_project_average.ipynb`
+- Seeded comparison notebook: `C147A_project_seeded.ipynb`
+- Single-run development notebook: `C147A_project_nonseeded.ipynb`
 - Main training script: `run_project_mhattn.py`
 - Core library: `stock_return_core.py`
 
@@ -93,9 +95,9 @@ After averaging, the more defensible conclusion is:
 
 ## File Guide
 
-- `C147A_project_average.ipynb`: main multi-seed notebook for summary results
-- `C147A_project_average.executed.ipynb`: executed notebook with outputs and figures
-- `C147A_project.ipynb`: single-run notebook variant
+- `C147A_project_average.ipynb`: main multi-seed notebook with outputs
+- `C147A_project_seeded.ipynb`: fixed-seed notebook with outputs
+- `C147A_project_nonseeded.ipynb`: single-run development notebook
 - `run_project_mhattn.py`: script entry point for attention experiments
 - `run_project_attention_ts.py`: related experiment script
 - `stock_return_core.py`: shared project library
