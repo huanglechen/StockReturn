@@ -11,7 +11,6 @@ Archived scripts currently include:
 - `run_project_mhattn_initial.py`
 - `run_project_tempattn_initial.py`
 - `stock_return_project.py`
-- `stock_return_project2.py`
 - `stock_return_project3.py`
 
 Use the top-level files instead:
